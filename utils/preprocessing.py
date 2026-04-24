@@ -6,7 +6,8 @@ All data is sourced exclusively from data/Dataset-Attacks-Firewall.csv.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,23 @@ logger = setup_logging("aura.preprocessing")
 
 RISK_NAMES: List[str] = ["Safe", "Suspicious", "Malicious", "Critical"]
 
+FIREWALL_REQUIRED_COLUMNS: Set[str] = {
+    "Data",
+    "mod_date",
+    "pub_date",
+    "cvss",
+    "Firewall Traffics",
+    "cwe_code",
+    "cwe_name",
+    "summary",
+    "access_authentication",
+    "access_complexity",
+    "access_vector",
+    "impact_availability",
+    "impact_confidentiality",
+    "impact_integrity",
+}
+
 CAT_COLS = [
     "access_authentication",
     "access_complexity",
@@ -30,6 +48,10 @@ CAT_COLS = [
     "impact_confidentiality",
     "impact_integrity",
 ]
+
+GENERIC_MAX_ONEHOT_CATEGORIES = 40
+GENERIC_RARE_CATEGORY_THRESHOLD = 0.04
+GENERIC_ID_UNIQUENESS_THRESHOLD = 0.95
 
 NUM_COLS = [
     "cwe_code",
@@ -73,66 +95,167 @@ def parse_firewall_octets(value: Any) -> Tuple[float, float, float, float]:
     return tuple(nums[:4])  # type: ignore[return-value]
 
 
-def load_raw_dataset(csv_path: Optional[str] = None) -> pd.DataFrame:
-    """Load the firewall dataset CSV."""
-    path = DEFAULT_DATA_PATH if csv_path is None else Path(csv_path)
+@lru_cache(maxsize=4)
+def _cached_load_raw_dataset(path_str: str) -> pd.DataFrame:
+    path = Path(path_str)
     if not path.exists():
         raise FileNotFoundError(f"Dataset not found at {path}")
     df = pd.read_csv(path)
-    expected = {
-        "Data",
-        "mod_date",
-        "pub_date",
-        "cvss",
-        "Firewall Traffics",
-        "cwe_code",
-        "cwe_name",
-        "summary",
-        "access_authentication",
-        "access_complexity",
-        "access_vector",
-        "impact_availability",
-        "impact_confidentiality",
-        "impact_integrity",
-    }
-    missing = expected - set(df.columns)
-    if missing:
-        raise ValueError(f"Dataset missing required columns: {sorted(missing)}")
-    logger.info("Loaded dataset rows=%s cols=%s", len(df), len(df.columns))
+    logger.info("Loaded dataset rows=%s cols=%s from %s", len(df), len(df.columns), path)
     return df
+
+
+def load_raw_dataset(csv_path: Optional[str] = None) -> pd.DataFrame:
+    """Load the firewall dataset CSV with caching for repeated access."""
+    path = DEFAULT_DATA_PATH if csv_path is None else Path(csv_path)
+    expected = FIREWALL_REQUIRED_COLUMNS
+    df = _cached_load_raw_dataset(str(path))
+    if not expected.issubset(set(df.columns)):
+        missing = expected - set(df.columns)
+        raise ValueError(f"Dataset missing required columns: {sorted(missing)}")
+    return df.copy()
+
+
+def _is_firewall_dataset(df: pd.DataFrame) -> bool:
+    return FIREWALL_REQUIRED_COLUMNS.issubset(set(df.columns))
+
+
+def _infer_generic_column_types(df: pd.DataFrame) -> Dict[str, Any]:
+    detected = {
+        "numeric": [],
+        "datetime": [],
+        "categorical": [],
+        "id": [],
+        "timestamp": [],
+        "entity": [],
+    }
+    n = len(df)
+    for col in df.columns:
+        series = df[col]
+        if series.dtype.kind in "biufc":
+            detected["numeric"].append(col)
+        else:
+            numeric = pd.to_numeric(series, errors="coerce")
+            numeric_ratio = numeric.notna().sum() / max(1, n)
+            dt = pd.to_datetime(series, errors="coerce")
+            datetime_ratio = dt.notna().sum() / max(1, n)
+            unique_ratio = series.nunique(dropna=True) / max(1, n)
+            if datetime_ratio >= 0.75:
+                detected["datetime"].append(col)
+                detected["timestamp"].append(col)
+            elif numeric_ratio >= 0.75:
+                detected["numeric"].append(col)
+            else:
+                detected["categorical"].append(col)
+            if unique_ratio >= GENERIC_ID_UNIQUENESS_THRESHOLD:
+                detected["id"].append(col)
+            if 0.05 < unique_ratio < 0.95 and col not in detected["numeric"] and col not in detected["datetime"]:
+                detected["entity"].append(col)
+    return detected
+
+
+def _safe_transform_datetime(series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(series, errors="coerce")
+    if dt.isna().all():
+        return pd.Series([pd.NaT] * len(series), index=series.index)
+    median = dt.median()
+    return dt.fillna(median)
+
+
+def _cast_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+def _build_generic_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    schema = _infer_generic_column_types(out)
+
+    for col in schema["datetime"]:
+        out[col] = _safe_transform_datetime(out[col])
+    for col in schema["numeric"]:
+        out[col] = _cast_numeric(out[col])
+
+    # Basic safe fill strategy
+    for col in out.columns:
+        if col in schema["numeric"]:
+            out[col] = out[col].fillna(out[col].median() if not out[col].isna().all() else 0.0).astype(float)
+        elif col in schema["datetime"]:
+            out[col] = out[col].fillna(out[col].median())
+        else:
+            out[col] = out[col].fillna("MISSING").astype(str)
+
+    # Normalize timestamp to epoch seconds
+    for col in schema["datetime"]:
+        out[f"{col}_epoch"] = out[col].astype("int64") // 10**9
+        out[f"{col}_hour"] = out[col].dt.hour.fillna(0).astype(int)
+        out[f"{col}_weekday"] = out[col].dt.weekday.fillna(0).astype(int)
+        out[f"{col}_day"] = out[col].dt.day.fillna(0).astype(int)
+
+    # Frequency and rarity features for categorical columns
+    for col in schema["categorical"]:
+        value_counts = out[col].value_counts(dropna=False)
+        freq = out[col].map(value_counts).fillna(0).astype(float)
+        out[f"{col}_freq"] = freq
+        out[f"{col}_rare"] = (freq < max(1.0, len(out) * GENERIC_RARE_CATEGORY_THRESHOLD)).astype(int)
+
+    # Entity-based temporal features if a timestamp exists
+    primary_ts = schema["timestamp"][0] if schema["timestamp"] else None
+    if primary_ts and schema["entity"]:
+        out = out.sort_values(primary_ts).reset_index(drop=True)
+        for entity_col in schema["entity"]:
+            groups = out.groupby(entity_col)[primary_ts]
+            delta = groups.diff().dt.total_seconds().fillna(0.0)
+            out[f"{entity_col}_event_interval"] = delta.fillna(0.0).astype(float)
+            out[f"{entity_col}_frequency"] = groups.transform("count").astype(float)
+
+    # Numeric trend features and score proxies
+    for col in schema["numeric"]:
+        median = out[col].median() if not out[col].isna().all() else 0.0
+        std = out[col].std() if not out[col].isna().all() else 0.0
+        out[f"{col}_zscore"] = ((out[col] - median) / (std if std else 1.0)).fillna(0.0).astype(float)
+        out[f"{col}_log"] = np.log1p(out[col].abs()).astype(float)
+
+    if schema["timestamp"]:
+        ts = out[schema["timestamp"][0]].astype("int64") // 10**9
+        out["age_seconds"] = (ts - ts.min()).astype(float)
+        out["trend_delta"] = ts.diff().fillna(0).astype(float)
+
+    return out
 
 
 def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Clean rows and engineer tabular features used by all models."""
-    out = df.copy()
-    out["summary"] = out["summary"].fillna("").astype(str)
-    out["summary_len"] = out["summary"].str.len().clip(0, 20000)
+    if _is_firewall_dataset(df):
+        out = df.copy()
+        out["summary"] = out["summary"].fillna("").astype(str)
+        out["summary_len"] = out["summary"].str.len().clip(0, 20000)
 
-    octets = out["Firewall Traffics"].apply(parse_firewall_octets)
-    out["fw_o1"] = octets.apply(lambda t: t[0])
-    out["fw_o2"] = octets.apply(lambda t: t[1])
-    out["fw_o3"] = octets.apply(lambda t: t[2])
-    out["fw_o4"] = octets.apply(lambda t: t[3])
+        octets = out["Firewall Traffics"].apply(parse_firewall_octets)
+        out["fw_o1"] = octets.apply(lambda t: t[0])
+        out["fw_o2"] = octets.apply(lambda t: t[1])
+        out["fw_o3"] = octets.apply(lambda t: t[2])
+        out["fw_o4"] = octets.apply(lambda t: t[3])
 
-    for col in CAT_COLS:
-        out[col] = out[col].fillna("MISSING").astype(str)
+        for col in CAT_COLS:
+            out[col] = out[col].fillna("MISSING").astype(str)
 
-    out["pub_ts"] = pd.to_datetime(out["pub_date"], dayfirst=True, errors="coerce")
-    out["mod_ts"] = pd.to_datetime(out["mod_date"], dayfirst=True, errors="coerce")
-    median_pub = out["pub_ts"].median()
-    median_mod = out["mod_ts"].median()
-    out["pub_ts"] = out["pub_ts"].fillna(median_pub)
-    out["mod_ts"] = out["mod_ts"].fillna(median_mod)
-    out["pub_ts"] = out["pub_ts"].astype("int64") // 10**9
-    out["mod_ts"] = out["mod_ts"].astype("int64") // 10**9
+        out["pub_ts"] = pd.to_datetime(out["pub_date"], dayfirst=True, errors="coerce")
+        out["mod_ts"] = pd.to_datetime(out["mod_date"], dayfirst=True, errors="coerce")
+        median_pub = out["pub_ts"].median()
+        median_mod = out["mod_ts"].median()
+        out["pub_ts"] = out["pub_ts"].fillna(median_pub)
+        out["mod_ts"] = out["mod_ts"].fillna(median_mod)
+        out["pub_ts"] = out["pub_ts"].astype("int64") // 10**9
+        out["mod_ts"] = out["mod_ts"].astype("int64") // 10**9
 
-    out["cwe_code"] = pd.to_numeric(out["cwe_code"], errors="coerce").fillna(0.0)
-    out["cvss"] = pd.to_numeric(out["cvss"], errors="coerce")
-    if out["cvss"].isna().any():
-        raise ValueError("CVSS column contains non-numeric values after coercion")
+        out["cwe_code"] = pd.to_numeric(out["cwe_code"], errors="coerce").fillna(0.0)
+        out["cvss"] = pd.to_numeric(out["cvss"], errors="coerce")
+        if out["cvss"].isna().any():
+            raise ValueError("CVSS column contains non-numeric values after coercion")
 
-    out["risk_class"] = out["cvss"].apply(cvss_to_risk_class)
-    return out
+        out["risk_class"] = out["cvss"].apply(cvss_to_risk_class)
+        return out
+    return _build_generic_feature_frame(df)
 
 
 def make_preprocessor() -> ColumnTransformer:

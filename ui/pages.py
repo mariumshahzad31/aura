@@ -993,9 +993,16 @@ def render_anomaly_check(
         uploaded_file = st.file_uploader("Choose CSV file", type="csv")
         if uploaded_file:
             try:
-                bulk_df = pd.read_csv(uploaded_file)
+                bulk_df = pd.read_csv(uploaded_file, low_memory=False)
                 record_to_analyze = bulk_df.iloc[0].to_dict()
                 st.success(f"Loaded {len(bulk_df)} records. Analyzing first record.")
+                with st.expander("Uploaded dataset summary", expanded=True):
+                    st.write({
+                        "rows": len(bulk_df),
+                        "columns": list(bulk_df.columns),
+                        "sample_types": {col: str(dtype) for col, dtype in bulk_df.dtypes.items()},
+                    })
+                    st.dataframe(bulk_df.head(5))
             except Exception as e:
                 st.error(f"Error reading file: {e}")
     

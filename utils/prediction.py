@@ -14,6 +14,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import IsolationForest
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import OneClassSVM
 
 from utils.helpers import MODELS_DIR, setup_logging
 from utils.preprocessing import (
@@ -62,6 +68,116 @@ def _load_keras_model(path: Path):
     if not path.exists():
         raise FileNotFoundError(f"LSTM model missing at {path}")
     return keras.models.load_model(path)
+
+
+def _scale_scores(scores: np.ndarray) -> np.ndarray:
+    if len(scores) == 0:
+        return scores
+    scaled = (scores - np.nanmin(scores)) / max(1e-6, np.nanmax(scores) - np.nanmin(scores))
+    return np.nan_to_num(scaled, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def _build_generic_feature_matrix(feature_df: pd.DataFrame) -> Tuple[np.ndarray, ColumnTransformer, List[str]]:
+    numeric_cols = feature_df.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = [
+        col
+        for col in feature_df.select_dtypes(include=["object", "category"]).columns.tolist()
+        if 2 <= feature_df[col].nunique(dropna=False) <= 40
+    ]
+
+    transformers = []
+    if numeric_cols:
+        transformers.append(
+            (
+                "num",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                numeric_cols,
+            )
+        )
+    if categorical_cols:
+        transformers.append(
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
+                        (
+                            "onehot",
+                            OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=40),
+                        ),
+                    ]
+                ),
+                categorical_cols,
+            )
+        )
+
+    if not transformers:
+        raise ValueError("No suitable generic columns found for anomaly detection")
+
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    X = preprocessor.fit_transform(feature_df)
+    if hasattr(X, "toarray"):
+        X = np.asarray(X.toarray(), dtype=np.float32)
+    else:
+        X = np.asarray(X, dtype=np.float32)
+    return X, preprocessor, numeric_cols + categorical_cols
+
+
+def _generic_sequence_score(feature_df: pd.DataFrame) -> np.ndarray:
+    timestamp_cols = [col for col in feature_df.columns if col.endswith("_epoch") or col.endswith("_ts")]
+    if not timestamp_cols:
+        return np.zeros(len(feature_df), dtype=np.float32)
+    ts = feature_df[timestamp_cols[0]].astype(float).to_numpy()
+    if len(ts) < 4:
+        return np.zeros(len(ts), dtype=np.float32)
+    diffs = np.diff(np.sort(ts))
+    if diffs.size == 0:
+        return np.zeros(len(ts), dtype=np.float32)
+    mean_d = float(np.mean(diffs))
+    std_d = float(np.std(diffs)) or 1.0
+    score = np.zeros(len(ts), dtype=np.float32)
+    score[1:] = np.abs(np.diff(ts) - mean_d) / std_d
+    return _scale_scores(score)
+
+
+def _generic_risk_from_score(score: float) -> int:
+    if score >= 0.75:
+        return 3
+    if score >= 0.5:
+        return 2
+    if score >= 0.25:
+        return 1
+    return 0
+
+
+def _generic_explanation(feature_df: pd.DataFrame, score: float, anomaly_flag: int) -> Dict[str, str]:
+    reasons: List[str] = []
+    if anomaly_flag < 0:
+        reasons.append("Model ensemble detected a deviation from typical patterns.")
+    if score >= 0.75:
+        reasons.append("Strong anomaly signal: rare combination or sudden spike detected.")
+    elif score >= 0.5:
+        reasons.append("Moderate anomaly signal: unusual feature distribution or timing observed.")
+    elif score >= 0.25:
+        reasons.append("Low anomaly signal: behavior is slightly uncommon but not highly suspicious.")
+    else:
+        reasons.append("Behavior appears consistent with the available sample set.")
+
+    if "_rare" in " ".join(feature_df.columns):
+        reasons.append("Rare category combinations or infrequent values contributed to the score.")
+    if any(col.endswith("_epoch") for col in feature_df.columns):
+        reasons.append("Timestamp sequencing / timing deviation was included in the anomaly signal.")
+
+    return {
+        "anomaly_narrative": " ".join(reasons),
+        "anomaly_score_description": f"Ensemble anomaly score {score:.2f} (higher means more unusual).",
+        "recommended_action": "Review flagged record and compare against historical data before escalating.",
+    }
 
 
 class AuraPredictor:
@@ -168,6 +284,91 @@ class AuraPredictor:
         """X_seq shape (batch, seq_len, n_features)."""
         return self.lstm.predict(X_seq, verbose=0)
 
+    def _is_firewall_input(self, df: pd.DataFrame) -> bool:
+        required = {"Firewall Traffics", "cvss", "pub_date", "mod_date", "cwe_code", "summary"}
+        return required.issubset(set(df.columns))
+
+    def _predict_generic_records(
+        self,
+        feature_df: pd.DataFrame,
+        live_metas: List[Optional[Dict[str, Any]]],
+        include_explanation: bool,
+    ) -> List[Dict[str, Any]]:
+        try:
+            X, preprocessor, cols = _build_generic_feature_matrix(feature_df)
+        except Exception as e:
+            logger.warning("Generic feature matrix creation failed: %s", e)
+            X = np.zeros((len(feature_df), 1), dtype=np.float32)
+            preprocessor = None
+            cols = []
+
+        if X.shape[0] < 2:
+            anomaly_score = np.zeros(len(X), dtype=np.float64)
+            anomaly_flag = np.ones(len(X), dtype=np.int32)
+        else:
+            isolation = IsolationForest(contamination="auto", n_estimators=120, random_state=42, n_jobs=-1)
+            isolation.fit(X)
+            iso_score = isolation.score_samples(X)
+            anomaly_flag = isolation.predict(X).astype(np.int32)
+            anomaly_score = -iso_score
+            anomaly_score = _scale_scores(anomaly_score)
+
+        try:
+            sequence_signal = _generic_sequence_score(feature_df)
+        except Exception:
+            sequence_signal = np.zeros(len(feature_df), dtype=np.float32)
+
+        if X.shape[0] > 20:
+            try:
+                ocsvm = OneClassSVM(nu=0.1, gamma="scale")
+                ocsvm.fit(X)
+                ocsvm_score = ocsvm.decision_function(X)
+                ocsvm_score = _scale_scores(-ocsvm_score)
+            except Exception as e:
+                logger.warning("OneClassSVM failed for generic data: %s", e)
+                ocsvm_score = np.zeros(len(X), dtype=np.float32)
+        else:
+            ocsvm_score = np.zeros(len(X), dtype=np.float32)
+
+        ensemble_score = _scale_scores(0.55 * anomaly_score + 0.3 * sequence_signal + 0.15 * ocsvm_score)
+
+        out: List[Dict[str, Any]] = []
+        for i in range(len(feature_df)):
+            score = float(ensemble_score[i]) if i < len(ensemble_score) else 0.0
+            flag = int(anomaly_flag[i]) if i < len(anomaly_flag) else 1
+            risk_code = _generic_risk_from_score(score)
+            risk_name = RISK_NAMES[risk_code]
+            cvss_pred = float(np.clip(score * 10.0, 0.0, 10.0))
+
+            row = {
+                "risk_class": risk_name,
+                "risk_code": risk_code,
+                "risk_probabilities": {RISK_NAMES[j]: float(1.0 / len(RISK_NAMES)) for j in range(len(RISK_NAMES))},
+                "anomaly_score_flag": flag,
+                "anomaly_score": score,
+                "cvss_predicted": cvss_pred,
+                "confidence": float(1.0 - min(score * 0.5, 0.75)),
+            }
+
+            cve_value = None
+            for cve_col in ["Data", "cve_id", "cve", "CVE", "vulnerability"]:
+                if cve_col in feature_df.columns:
+                    try:
+                        cve_value = feature_df[cve_col].iloc[i]
+                        break
+                    except (KeyError, IndexError):
+                        continue
+            row["cve_id"] = cve_value
+
+            if i < len(live_metas) and live_metas[i]:
+                row["live_meta"] = live_metas[i]
+
+            if include_explanation:
+                row["explanation"] = _generic_explanation(feature_df, score, flag)
+            out.append(row)
+
+        return out
+
     def build_sequence_for_index(
         self,
         ordered_feature_df: pd.DataFrame,
@@ -204,18 +405,21 @@ class AuraPredictor:
             
             df = pd.DataFrame(clean_rows)
             feature_df = build_feature_frame(df)
-            
-            try:
-                preds, proba, anomaly, anomaly_score, cvss_hat = self.predict_tabular(feature_df)
-            except Exception as e:
-                logger.error(f"predict_tabular failed: {e}, using fallback")
-                # Fallback: default predictions
-                preds = np.zeros(len(feature_df), dtype=np.int32)
-                proba = np.zeros((len(feature_df), len(RISK_NAMES)), dtype=np.float32)
-                proba[:, 0] = 1.0
-                anomaly = np.ones(len(feature_df), dtype=np.int32)
-                anomaly_score = np.zeros(len(feature_df), dtype=np.float64)
-                cvss_hat = np.ones(len(feature_df)) * 5.0
+
+            if self._is_firewall_input(df):
+                try:
+                    preds, proba, anomaly, anomaly_score, cvss_hat = self.predict_tabular(feature_df)
+                except Exception as e:
+                    logger.error(f"predict_tabular failed: {e}, using fallback")
+                    preds = np.zeros(len(feature_df), dtype=np.int32)
+                    proba = np.zeros((len(feature_df), len(RISK_NAMES)), dtype=np.float32)
+                    proba[:, 0] = 1.0
+                    anomaly = np.ones(len(feature_df), dtype=np.int32)
+                    anomaly_score = np.zeros(len(feature_df), dtype=np.float64)
+                    cvss_hat = np.ones(len(feature_df)) * 5.0
+            else:
+                out = self._predict_generic_records(feature_df, live_metas, include_explanation)
+                return out
             
             out: List[Dict[str, Any]] = []
             for i in range(len(feature_df)):

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 
@@ -68,12 +69,12 @@ async def health() -> Dict[str, str]:
 @app.get("/api/v1/status", response_model=SystemStatus)
 async def status_endpoint(user: Dict[str, Any] = Depends(get_current_user)) -> SystemStatus:
     try:
-        get_predictor()
+        await run_in_threadpool(get_predictor)
         ready = True
     except Exception:  # noqa: BLE001
         ready = False
     fw = get_firewall_manager().state()
-    df = load_raw_dataset()
+    df = await run_in_threadpool(load_raw_dataset)
     mon = get_or_create_monitor(df).state()
     beh = get_behavior_store().snapshot()
     return SystemStatus(
@@ -100,8 +101,13 @@ async def predict_endpoint(
 ) -> Dict[str, Any]:
     """Predict endpoint with comprehensive error handling"""
     try:
-        pred = get_predictor()
-        out = pred.predict_records(body.records, include_explanation=body.include_explanation, use_llm=body.use_llm)
+        pred = await run_in_threadpool(get_predictor)
+        out = await run_in_threadpool(
+            pred.predict_records,
+            body.records,
+            include_explanation=body.include_explanation,
+            use_llm=body.use_llm,
+        )
         now = datetime.now(timezone.utc).isoformat()
         
         for row in out:
